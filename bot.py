@@ -9,6 +9,8 @@ import threading
 import time
 import requests
 import chat_features as features
+import discussions
+from delivery_queue import RateLimiter, Deferred, claim
 from db import DATA, connect, decide, enqueue, event, get, init_db, set_value
 
 log=logging.getLogger('anon')
@@ -28,10 +30,12 @@ class APIError(Exception):
 class UncertainError(Exception): pass
 
 class Telegram:
-    def __init__(self,token):
+    def __init__(self,token,limiter=None):
         self.token=token
+        self.limiter=limiter
         self.http=requests.Session()
     def call(self,method,**payload):
+        if self.limiter: self.limiter.acquire(method,payload)
         try:
             response=self.http.post(f'https://api.telegram.org/bot{self.token}/{method}',
                 json=payload,timeout=(5,40 if method=='getUpdates' else 20))
@@ -43,7 +47,9 @@ class Telegram:
             code=data.get('error_code',response.status_code)
             description=str(data.get('description','Ошибка API')).replace(self.token,'[TOKEN]')[:300]
             if code>=500: raise UncertainError(f'Telegram {code}: результат запроса неизвестен')
-            raise APIError(code,description,data.get('parameters',{}).get('retry_after',0))
+            retry_after=data.get('parameters',{}).get('retry_after',0)
+            if code==429 and self.limiter: self.limiter.backoff(retry_after or 1)
+            raise APIError(code,description,retry_after)
         return data['result']
 
 def post_content(message):
@@ -60,14 +66,26 @@ def post_content(message):
             return {'method':method,'data':data}
     raise ValueError('Unsupported post content')
 
-def send_post(api,post,destination,buttons=None):
+def send_post(api,post,destination,buttons=None,anonymous=False):
     if post['content']:
         content=json.loads(post['content'])
         payload=dict(content['data'],chat_id=destination)
+        if anonymous:
+            field='text' if content['method']=='sendMessage' else 'caption'
+            if content['method'] in ('sendSticker','sendVideoNote'):
+                raise APIError(400,'Для подписи Анон. отправьте текст или медиа с подписью')
+            payload[field]=payload.get(field,'')+'\n\nАнон.'
+            if len(payload[field].encode('utf-16-le'))//2>(4096 if field=='text' else 1024):
+                raise APIError(400,'Пост слишком длинный для подписи Анон.; сократите и отправьте заново')
         if buttons: payload['reply_markup']=buttons
         return api.call(content['method'],**payload)
     # Compatibility for existing v2 submissions, whose original message still exists.
+    if anonymous and post['kind']=='text':
+        text=post['preview']+'\n\nАнон.'
+        if len(text.encode('utf-16-le'))//2>4096: raise APIError(400,'Сократите старый пост для добавления подписи Анон.')
+        return api.call('sendMessage',chat_id=destination,text=text,reply_markup=buttons or {})
     payload={'chat_id':destination,'from_chat_id':post['source_chat'],'message_id':post['source_message']}
+    if anonymous: payload['caption']=(post['preview'] if not post['preview'].startswith('[') else '')+'\n\nАнон.'
     if buttons: payload['reply_markup']=buttons
     return api.call('copyMessage',**payload)
 
@@ -81,6 +99,7 @@ def reply(db,uid,text,menu=False):
 def process_update(update):
     update_id=update['update_id']
     callback=update.get('callback_query')
+    if callback and discussions.callback(update): return
     if callback and features.callback(update): return
     if callback:
         admins={int(x) for x in get('ADMIN_IDS').split(',') if x.strip().isdigit()}
@@ -111,13 +130,18 @@ def process_update(update):
         settings=dict(db.execute('SELECT key,value FROM settings').fetchall())
         text=m.get('text','')
         command=text.split()[0].split('@')[0] if text.startswith('/') else text
+        if command=='/start' and len(text.split())==2 and text.split()[1].startswith('post_') and text.split()[1][5:].isdigit():
+            db.execute("UPDATE users SET mode='idle',comment_post=NULL WHERE id=?",(uid,))
+            discussions.open_post(db,uid,int(text.split()[1][5:])); return
+        if command=='/notifications':
+            discussions.panel(db,uid); return
         if command in ('/start','/help'):
             db.execute("UPDATE users SET mode='idle' WHERE id=?",(uid,))
             reply(db,uid,'Добро пожаловать! Здесь можно общаться анонимно или предложить пост в канал. '
                   'Только посты проходят модерацию. В чате участники видят псевдонимы; '
                   'администрация сервера имеет доступ к Telegram ID. '
                   f"⚠️ Каждые {settings['CLEANUP_HOURS']} ч запускается очистка всей переписки с ботом: ваших сообщений, постов и ответов бота. "
-                  'Заявки на модерации и опубликованные посты в канале сохраняются. '
+                  'Заявки, опубликованные посты и комментарии к ним сохраняются. /notifications — уведомления о новых постах. '
                   'Удаление зависит от ограничений Telegram; скриншоты и сохранённые копии удалить невозможно.',True)
             return
         if command in ('/id','🆔 Мой ID'):
@@ -146,7 +170,7 @@ def process_update(update):
             return
         if command=='/cancel':
             db.execute("UPDATE users SET mode='idle' WHERE id=?",(uid,))
-            reply(db,uid,'Написание поста отменено.' + (' Вы снова пишете в чат.' if u['chat_active'] else ''),True)
+            reply(db,uid,'Ввод поста или комментария отменён.' + (' Вы снова пишете в чат.' if u['chat_active'] else ''),True)
             return
         if command in ('/members','/topic'):
             if u['chat_active']:
@@ -155,11 +179,10 @@ def process_update(update):
             return
         if text.startswith('/'):
             reply(db,uid,'Используйте кнопки меню или /chat, /leave, /post, /cancel.',True); return
+        if discussions.receive(db,u,m): return
         if u['mode']!='post' and not u['chat_active']:
             reply(db,uid,'Сначала нажмите «Вступить в анонимный чат» или «Написать пост».',True); return
         now=time.time()
-        if now-u['last_sent']<int(settings['COOLDOWN_SECONDS']):
-            reply(db,uid,'Слишком быстро. Подождите несколько секунд и отправьте сообщение снова.'); return
         if u['mode']!='post':
             if settings['CHAT_ENABLED']!='1':
                 reply(db,uid,'Анонимный чат временно выключен.',True); return
@@ -187,6 +210,10 @@ def process_update(update):
         if m.get('media_group_id'):
             reply(db,uid,'Альбом не принят. Отправьте нужное фото или видео отдельно.'); return
         kind=next((k for k in ('text','photo','video','animation','document','audio','voice','video_note','sticker') if k in m),None)
+        if kind in ('sticker','video_note'):
+            reply(db,uid,'Для поста с подписью Анон. отправьте текст, фото, видео или другое медиа с подписью.'); return
+        if len(m.get('text','').encode('utf-16-le'))//2>4089 or len(m.get('caption','').encode('utf-16-le'))//2>1017:
+            reply(db,uid,'Сократите пост: максимум 4089 символов текста или 1017 символов подписи, чтобы добавить Анон.'); return
         if not kind:
             reply(db,uid,'Этот тип сообщения не поддерживается. Отправьте текст или медиа.'); return
         preview=(m.get('text') or m.get('caption') or f'[{kind}]')[:4096]
@@ -215,13 +242,6 @@ def poll(token):
             with connect() as db: event(db,f'Получение обновлений: {type(e).__name__}: {str(e)[:300]}')
             STOP.wait(max(5, e.retry_after) if isinstance(e, APIError) else 5)
 
-def claim():
-    with connect() as db:
-        db.execute('BEGIN IMMEDIATE')
-        row=db.execute("SELECT * FROM jobs WHERE status='queued' AND run_after<=? ORDER BY CASE kind WHEN 'answer' THEN 0 ELSE 1 END,id LIMIT 1",(time.time(),)).fetchone()
-        if row: db.execute("UPDATE jobs SET status='running' WHERE id=?",(row['id'],))
-        return dict(row) if row else None
-
 def rotate():
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -231,6 +251,7 @@ def rotate():
 
 def execute_job(api,job,secret):
     p=json.loads(job['payload']); kind=job['kind']
+    if kind in ('post_notice','discussion_view'): return discussions.execute(api,job,secret)
     if kind in ('social','reaction_edit','reaction_notice'): return features.execute(api,job,secret)
     if kind in ('send','answer'):
         sent=api.call('sendMessage' if kind=='send' else 'answerCallbackQuery',**p)
@@ -254,11 +275,14 @@ def execute_job(api,job,secret):
             post=db.execute('SELECT * FROM posts WHERE id=?',(p['post_id'],)).fetchone()
             if post['status']!='queued': return 'Заявка уже обработана'
             db.execute("UPDATE posts SET status='publishing' WHERE id=?",(post['id'],))
-        sent=send_post(api,post,post['destination'])
+        username=get('BOT_USERNAME')
+        buttons={'inline_keyboard':[[{'text':'💬 Анонимные комментарии','url':f"https://t.me/{username}?start=post_{post['id']}"}]]} if username else None
+        sent=send_post(api,post,post['destination'],buttons,anonymous=True)
         with connect() as db:
             db.execute("UPDATE posts SET status='published',published_message=? WHERE id=?",(sent['message_id'],post['id']))
             reply(db,post['uid'],f"Заявка #{post['id']} опубликована.")
             event(db,f"Опубликована заявка #{post['id']}")
+            discussions.published(db,post)
         return f"Опубликовано: сообщение {sent['message_id']}"
     if kind=='chat':
         return 'Старая доставка в группу отменена'
@@ -290,6 +314,9 @@ def execute_job(api,job,secret):
     if kind=='cleanup':
         deleted=failed=0
         cutoff=p.get('cutoff',time.time())
+        if 'cutoff' not in p and 'id' in job:
+            p['cutoff']=cutoff
+            with connect() as db: db.execute('UPDATE jobs SET payload=? WHERE id=?',(json.dumps(p),job['id']))
         with connect() as db:
             features.expire(db,cutoff)
             # Don't deliver stale queued chat content after the cleanup cycle.
@@ -338,6 +365,8 @@ def execute_job(api,job,secret):
 def run_job(api,job,secret):
     status='done'; result=''; retry=0
     try: result=execute_job(api,job,secret)
+    except Deferred as e:
+        status='queued'; retry=time.time()+e.delay; result='Ожидает свободного слота Telegram'
     except APIError as e:
         if e.code==429:
             status='queued'; retry=time.time()+max(1,e.retry_after)
@@ -353,6 +382,9 @@ def run_job(api,job,secret):
             pid=json.loads(job['payload'])['post_id']
             db.execute('UPDATE posts SET status=? WHERE id=? AND status IN (?,?)',(status,pid,'publishing','queued'))
         if status in ('failed','uncertain'): event(db,f"Задача #{job['id']} ({job['kind']}): {result}")
+        if status=='failed' and result.startswith('Telegram 403:') and job['kind'] in ('send','post_notice','discussion_view'):
+            p=json.loads(job['payload']); uid=p.get('uid',p.get('chat_id'))
+            if uid and int(uid)>0: db.execute('UPDATE users SET notifications=0,chat_active=0,chat_session=chat_session+1 WHERE id=?',(uid,))
         if job['kind']=='chat_delivery':
             if status=='failed' and result.startswith('Telegram 403:'):
                 p=json.loads(job['payload'])
@@ -370,6 +402,14 @@ def recover():
         for row in db.execute("SELECT payload FROM jobs WHERE kind='publish' AND status='uncertain'").fetchall():
             db.execute("UPDATE posts SET status='uncertain' WHERE id=? AND status='queued'",(json.loads(row['payload'])['post_id'],))
 
+def worker(token,secret,limiter):
+    api=Telegram(token,limiter)
+    while not STOP.is_set():
+        job=claim()
+        if job: run_job(api,job,secret)
+        else: STOP.wait(.05)
+
+
 def main():
     import fcntl
     init_db()
@@ -381,6 +421,8 @@ def main():
     config=json.loads(path.read_text()); api=Telegram(config['bot_token'])
     # Do not silently remove a webhook installed by another application.
     try:
+        me=api.call('getMe')
+        with connect() as db: set_value(db,'BOT_USERNAME',me['username'])
         info=api.call('getWebhookInfo')
         if info.get('url'): raise SystemExit('У бота установлен webhook. Отключите старое приложение и webhook перед запуском polling.')
     except (APIError,UncertainError) as e: raise SystemExit(str(e)) from None
@@ -388,9 +430,13 @@ def main():
     for sig in (signal.SIGTERM,signal.SIGINT): signal.signal(sig,lambda *_:STOP.set())
     thread=threading.Thread(target=poll,args=(config['bot_token'],),daemon=True)
     thread.start()
+    limiter=RateLimiter()
+    workers=[threading.Thread(target=worker,args=(config['bot_token'],config['secret_key'],limiter),daemon=True) for _ in range(8)]
+    for item in workers: item.start()
     next_tick=0
     while not STOP.is_set():
-        if not thread.is_alive(): raise RuntimeError('Поток получения сообщений остановился')
+        if not thread.is_alive() or any(not item.is_alive() for item in workers):
+            STOP.set(); raise RuntimeError('Остановился поток обработки; systemd перезапустит процесс')
         now=time.time()
         if now>=next_tick:
             with connect() as db:
@@ -401,10 +447,9 @@ def main():
                     if not db.execute("SELECT 1 FROM jobs WHERE kind='cleanup' AND status IN ('queued','running')").fetchone(): enqueue(db,'cleanup',{})
                     set_value(db,'LAST_CLEANUP',now)
             next_tick=now+10
-        job=claim()
-        if job: run_job(api,job,config['secret_key'])
-        else: STOP.wait(.25)
-    thread.join(timeout=40)
+        STOP.wait(.5)
+    deadline=time.monotonic()+45
+    for item in [thread]+workers: item.join(timeout=max(0,deadline-time.monotonic()))
     with connect() as db: set_value(db,'HEARTBEAT',0)
 
 if __name__=='__main__':

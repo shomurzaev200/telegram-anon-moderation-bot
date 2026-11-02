@@ -11,13 +11,13 @@ DATA = ROOT / 'data'
 DATA.mkdir(mode=0o700, exist_ok=True)
 DB_PATH = DATA / 'anon-v2.sqlite3'
 DEFAULTS = {'ADMIN_IDS':'', 'MODERATION_CHANNEL_ID':'', 'PUBLIC_CHANNEL_ID':'',
- 'ANON_GROUP_ID':'', 'CHAT_ENABLED':'0', 'CLEANUP_HOURS':'12', 'COOLDOWN_SECONDS':'10',
+ 'ANON_GROUP_ID':'', 'CHAT_ENABLED':'0', 'CLEANUP_HOURS':'12', 'COOLDOWN_SECONDS':'0',
  'RULES':'Запрещены угрозы, спам, реклама и незаконный контент. Не отправляйте личные данные.',
  'AUTH_VERSION':'1', 'NICK_EPOCH':'1'}
 
 @contextmanager
 def connect():
-    db = sqlite3.connect(DB_PATH, timeout=5)
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     try:
@@ -62,6 +62,9 @@ def _init_db():
           session INTEGER NOT NULL,is_bot INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id));
         CREATE INDEX IF NOT EXISTS relay_copies_message ON relay_copies(relay_id,chat_id,session);
         CREATE TABLE IF NOT EXISTS chat_reactions(relay_id INTEGER,uid INTEGER,emoji TEXT NOT NULL,PRIMARY KEY(relay_id,uid));
+        CREATE TABLE IF NOT EXISTS post_comments(id INTEGER PRIMARY KEY,post_id INTEGER NOT NULL,uid INTEGER NOT NULL,
+          body TEXT NOT NULL,created REAL NOT NULL,hidden INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS comments_post ON post_comments(post_id,hidden,id);
         CREATE TABLE IF NOT EXISTS social_limits(uid INTEGER PRIMARY KEY,last REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT PRIMARY KEY,n INTEGER NOT NULL,until REAL NOT NULL);
         ''')
@@ -78,6 +81,20 @@ def _init_db():
             db.execute("UPDATE jobs SET status='cancelled',payload='{}',result='Старый групповой чат отключён' WHERE kind='chat' AND status='queued'")
             db.execute("INSERT INTO settings VALUES('RELAY_VERSION','1')")
         db.execute('CREATE INDEX IF NOT EXISTS users_chat_active ON users(chat_active,blocked)')
+        columns={r[1] for r in db.execute('PRAGMA table_info(users)')}
+        if 'notifications' not in columns: db.execute('ALTER TABLE users ADD COLUMN notifications INTEGER NOT NULL DEFAULT 1')
+        if 'comment_post' not in columns: db.execute('ALTER TABLE users ADD COLUMN comment_post INTEGER')
+        columns={r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+        if 'lane' not in columns: db.execute("ALTER TABLE jobs ADD COLUMN lane TEXT NOT NULL DEFAULT ''")
+        if 'priority' not in columns: db.execute('ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+        db.execute('CREATE INDEX IF NOT EXISTS jobs_lane ON jobs(lane,status,id)')
+        db.execute('CREATE INDEX IF NOT EXISTS jobs_dispatch ON jobs(status,priority DESC,id)')
+        for row in db.execute("SELECT id,kind,payload FROM jobs WHERE lane='' AND status IN ('queued','running')").fetchall():
+            lane,priority=route(db,row['kind'],json.loads(row['payload']))
+            db.execute('UPDATE jobs SET lane=?,priority=? WHERE id=?',(lane,priority,row['id']))
+        if not db.execute("SELECT 1 FROM settings WHERE key='DISCUSSIONS_VERSION'").fetchone():
+            db.execute("UPDATE settings SET value='0' WHERE key='COOLDOWN_SECONDS'")
+            db.execute("INSERT INTO settings VALUES('DISCUSSIONS_VERSION','1')")
         if 'content' not in {r[1] for r in db.execute('PRAGMA table_info(posts)')}:
             db.execute("ALTER TABLE posts ADD COLUMN content TEXT NOT NULL DEFAULT ''")
 
@@ -92,9 +109,20 @@ def get(key, default=''):
 def set_value(db,key,value):
     db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key,str(value)))
 
+def route(db,kind,payload):
+    priority=100 if kind=='answer' else 10 if kind in ('send','publish','moderate','discussion_view','social') else 0
+    recipient=payload.get('chat_id',payload.get('recipient',payload.get('uid')))
+    if kind=='publish':
+        post=db.execute('SELECT destination FROM posts WHERE id=?',(payload.get('post_id'),)).fetchone()
+        recipient=post[0] if post else None
+    if kind=='answer': return 'callback:'+payload.get('callback_query_id',''),priority
+    if recipient is not None: return 'chat:'+str(recipient),priority
+    return 'service:'+kind,priority
+
 def enqueue(db,kind,payload):
-    return db.execute('INSERT INTO jobs(kind,payload,created) VALUES(?,?,?)',
-                      (kind,json.dumps(payload,ensure_ascii=False),time.time())).lastrowid
+    lane,priority=route(db,kind,payload)
+    return db.execute('INSERT INTO jobs(kind,payload,created,lane,priority) VALUES(?,?,?,?,?)',
+                      (kind,json.dumps(payload,ensure_ascii=False),time.time(),lane,priority)).lastrowid
 
 def event(db,detail):
     db.execute('INSERT INTO events(created,detail) VALUES(?,?)',(time.time(),detail[:1500]))

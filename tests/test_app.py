@@ -123,11 +123,11 @@ def test_recover_running_job(setup):
 def test_settings_validation_and_save(setup):
     c,token=login(setup)
     vals={k:db.get(k) for k in admin.EDITABLE}; vals['csrf']=token
-    vals['COOLDOWN_SECONDS']='0'
+    vals['CLEANUP_HOURS']='0'
     assert c.post('/settings',data=vals).status_code==400
-    vals['COOLDOWN_SECONDS']='2'
+    vals['CLEANUP_HOURS']='2'
     assert c.post('/settings',data=vals).status_code==302
-    assert db.get('COOLDOWN_SECONDS')=='2'
+    assert db.get('CLEANUP_HOURS')=='2'
 
 def test_user_block_and_chat(setup):
     bot.process_update(message(99,99,'/chat',uid=13))
@@ -272,7 +272,7 @@ def test_private_cleanup_preserves_post_for_later_publication(setup):
     bot.run_job(api,job,'secret')
     assert api.calls[0][0]=='sendMessage'
     assert api.calls[0][1]['chat_id']==-1002
-    assert api.calls[0][1]['text']=='История'
+    assert api.calls[0][1]['text']=='История\n\nАнон.'
     with db.connect() as c: assert c.execute('SELECT status FROM posts').fetchone()[0]=='published'
 
 def test_cleanup_does_not_delete_groups_or_newer_messages(setup):

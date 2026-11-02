@@ -7,7 +7,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, sessi
 from werkzeug.security import check_password_hash, generate_password_hash
 from db import DATA, DEFAULTS, connect, decide, enqueue, event, get, init_db, set_value
 
-EDITABLE = tuple(k for k in DEFAULTS if k not in ('AUTH_VERSION','NICK_EPOCH','ANON_GROUP_ID'))
+EDITABLE = tuple(k for k in DEFAULTS if k not in ('AUTH_VERSION','NICK_EPOCH','ANON_GROUP_ID','COOLDOWN_SECONDS'))
 
 def create_app(test_config=None):
     init_db()
@@ -88,9 +88,10 @@ def create_app(test_config=None):
             stats=dict(db.execute('SELECT status,count(*) FROM posts GROUP BY status').fetchall())
             users=db.execute('SELECT count(*) FROM users').fetchone()[0]
             jobs=dict(db.execute('SELECT status,count(*) FROM jobs GROUP BY status').fetchall())
+            oldest=db.execute("SELECT min(created) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
         heartbeat=float(get('HEARTBEAT','0'))
         return render_template('index.html',stats=stats,users=users,jobs=jobs,
-            alive=time.time()-heartbeat<60,heartbeat=heartbeat)
+            alive=time.time()-heartbeat<60,heartbeat=heartbeat,queue_age=int(time.time()-oldest) if oldest else 0)
 
     @app.get('/posts')
     def posts():
@@ -127,7 +128,7 @@ def create_app(test_config=None):
                 if len({values[k] for k in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID')})!=2:
                     raise ValueError('Каналы модерации и публикации должны иметь разные ID.')
                 if values['CHAT_ENABLED'] not in ('0','1'): raise ValueError('CHAT_ENABLED: только 0 или 1')
-                for key,low,high in [('CLEANUP_HOURS',1,24),('COOLDOWN_SECONDS',1,3600)]:
+                for key,low,high in [('CLEANUP_HOURS',1,24)]:
                     if not values[key].isdigit() or not low<=int(values[key])<=high: raise ValueError(f'{key}: от {low} до {high}')
                 if not 1<=len(values['RULES'])<=3000: raise ValueError('Правила: от 1 до 3000 символов')
                 with connect() as db:
@@ -172,6 +173,20 @@ def create_app(test_config=None):
             if not exists: enqueue(db,kind,{})
         flash('Задача в очереди. Результат появится в разделе «Задачи».')
         return redirect(url_for('jobs'))
+
+    @app.get('/comments')
+    def comments():
+        page=max(1,request.args.get('page',1,type=int))
+        with connect() as db:
+            rows=db.execute('SELECT * FROM post_comments ORDER BY id DESC LIMIT 31 OFFSET ?',((page-1)*30,)).fetchall()
+        return render_template('comments.html',rows=rows[:30],more=len(rows)>30,page=page)
+
+    @app.post('/comments/<int:cid>/hide')
+    def hide_comment(cid):
+        with connect() as db:
+            db.execute('UPDATE post_comments SET hidden=1-hidden WHERE id=?',(cid,))
+            event(db,f'web-admin: изменение видимости комментария #{cid}')
+        return redirect(url_for('comments'))
 
     @app.get('/logs')
     def logs():
