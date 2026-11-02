@@ -1,2 +1,31 @@
-# telegram-anon-moderation-bot
-Telegram bot: anonymous posts with moderation channel + anonymous chat. Admin panel for all settings.
+# Telegram Anon Moderation Bot
+
+Бот с двумя функциями:
+1. **Анонимные посты** — пользователь пишет боту → заявка уходит в закрытый канал модерации → админ кнопкой публикует в основной канал.
+2. **Анонимный чат** — общение через бота (пользователи не пишут напрямую в группу). Очистка каждые 12 часов + смена ников.
+
+Все ID (каналы, группа, админы) настраиваются через веб-админку.
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# Вставь BOT_TOKEN в .env
+python bot.py
+# В другом терминале:
+python admin.py
+```
+
+Открой http://localhost:5000 (пароль в admin.py — смени его!).
+
+В админке укажи:
+- ADMIN_IDS (твой Telegram ID)
+- MODERATION_CHANNEL_ID
+- PUBLIC_CHANNEL_ID
+- ANON_GROUP_ID
+
+**Важно для группы:** в настройках супергруппы отключи обычным участникам право отправлять сообщения (только админы).
+
+## Правила
+Запрещено: порно, насилие, спам, реклама, угрозы.
