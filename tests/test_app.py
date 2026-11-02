@@ -247,7 +247,7 @@ def test_migration_preserves_settings_and_posts(setup):
 
 def test_active_menu_has_exit_and_post_only(setup):
     bot.process_update(message(text='/chat'))
-    with db.connect() as c: payload=json.loads(c.execute("SELECT payload FROM jobs WHERE kind='send' ORDER BY id DESC").fetchone()[0])
+    with db.connect() as c: payload=json.loads(c.execute("SELECT payload FROM jobs WHERE kind='send' AND json_type(payload,'$.reply_markup.keyboard') IS NOT NULL ORDER BY id DESC").fetchone()[0])
     buttons=[x['text'] for row in payload['reply_markup']['keyboard'] for x in row]
     assert buttons==[bot.POST,bot.LEAVE]
     assert 'очистка' in payload['text']

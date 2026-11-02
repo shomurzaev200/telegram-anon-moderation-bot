@@ -56,6 +56,13 @@ def _init_db():
         CREATE TABLE IF NOT EXISTS processed(update_id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS chat_messages(chat_id INTEGER,message_id INTEGER,created REAL NOT NULL,
           state TEXT DEFAULT 'active',PRIMARY KEY(chat_id,message_id));
+        CREATE TABLE IF NOT EXISTS relay_messages(id INTEGER PRIMARY KEY,uid INTEGER NOT NULL,
+          epoch TEXT NOT NULL,preview TEXT NOT NULL,parent_id INTEGER,created REAL NOT NULL,active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS relay_copies(chat_id INTEGER,message_id INTEGER,relay_id INTEGER NOT NULL,
+          session INTEGER NOT NULL,is_bot INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id));
+        CREATE INDEX IF NOT EXISTS relay_copies_message ON relay_copies(relay_id,chat_id,session);
+        CREATE TABLE IF NOT EXISTS chat_reactions(relay_id INTEGER,uid INTEGER,emoji TEXT NOT NULL,PRIMARY KEY(relay_id,uid));
+        CREATE TABLE IF NOT EXISTS social_limits(uid INTEGER PRIMARY KEY,last REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT PRIMARY KEY,n INTEGER NOT NULL,until REAL NOT NULL);
         ''')
         db.executemany('INSERT OR IGNORE INTO settings VALUES(?,?)', DEFAULTS.items())

@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 import requests
+import chat_features as features
 from db import DATA, connect, decide, enqueue, event, get, init_db, set_value
 
 log=logging.getLogger('anon')
@@ -80,6 +81,7 @@ def reply(db,uid,text,menu=False):
 def process_update(update):
     update_id=update['update_id']
     callback=update.get('callback_query')
+    if callback and features.callback(update): return
     if callback:
         admins={int(x) for x in get('ADMIN_IDS').split(',') if x.strip().isdigit()}
         text='Доступ запрещён'
@@ -131,6 +133,7 @@ def process_update(update):
                   f"⚠️ Каждые {settings['CLEANUP_HOURS']} ч запускается очистка всей переписки с ботом, включая ваши сообщения и посты. "
                   'Telegram может не разрешить удалить отдельные сообщения; сохранённые копии и скриншоты удалить невозможно. '
                   'Чтобы прекратить общение, нажмите «Выйти из анонимного чата».',True)
+            enqueue(db,'send',{'chat_id':uid,'text':'Ответь на реплику через «Ответить» в Telegram. Под сообщениями — анонимные реакции. Ещё можно посмотреть участников или получить тему для разговора.','reply_markup':features.TOOLS})
             return
         if command in ('/leave',LEAVE):
             db.execute("UPDATE users SET chat_active=0,chat_session=chat_session+1,mode='idle' WHERE id=?",(uid,))
@@ -145,6 +148,11 @@ def process_update(update):
             db.execute("UPDATE users SET mode='idle' WHERE id=?",(uid,))
             reply(db,uid,'Написание поста отменено.' + (' Вы снова пишете в чат.' if u['chat_active'] else ''),True)
             return
+        if command in ('/members','/topic'):
+            if u['chat_active']:
+                enqueue(db,'social',{'uid':uid,'session':u['chat_session'],'action':'members' if command=='/members' else 'topic'})
+            else: reply(db,uid,'Сначала вступите в чат.',True)
+            return
         if text.startswith('/'):
             reply(db,uid,'Используйте кнопки меню или /chat, /leave, /post, /cancel.',True); return
         if u['mode']!='post' and not u['chat_active']:
@@ -158,19 +166,20 @@ def process_update(update):
             media=next((k for k in ('photo','video','animation','document','voice','audio') if k in m),None)
             if m.get('media_group_id') or (not text and not media):
                 reply(db,uid,'Отправьте текст, отдельное фото, видео, анимацию, документ, аудио или голосовое. Альбомы, контакты и локации не поддерживаются.'); return
-            if len(text)>3500 or len(m.get('caption',''))>900:
+            if len(text.encode('utf-16-le'))//2>3500 or len(m.get('caption','').encode('utf-16-le'))//2>900:
                 reply(db,uid,'Максимум 3500 символов текста или 900 символов подписи.'); return
             content={'type':'text','text':text}
             if media:
                 file=m[media][-1] if media=='photo' else m[media]
                 content={'type':media,'file_id':file['file_id'],'text':m.get('caption','')}
+            relay_id=features.register(db,u,m,content,settings['NICK_EPOCH'])
             # Snapshot recipients and their membership generation at submission, not dispatch.
             members=db.execute('SELECT id,chat_session FROM users WHERE chat_active=1 AND blocked=0 AND id!=?',(uid,)).fetchall()
             db.execute('UPDATE users SET last_sent=? WHERE id=?',(now,uid))
             db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',(uid,m['message_id'],now))
             for member in members:
                 enqueue(db,'chat_delivery',{'uid':uid,'recipient':member['id'],'session':member['chat_session'],
-                    'epoch':settings['NICK_EPOCH'],'content':content})
+                    'epoch':settings['NICK_EPOCH'],'content':content,'relay_id':relay_id})
             if not members: reply(db,uid,'Сейчас других участников нет. Новые участники это сообщение не получат.')
             return
         if not settings['MODERATION_CHANNEL_ID'] or not settings['PUBLIC_CHANNEL_ID']:
@@ -222,6 +231,7 @@ def rotate():
 
 def execute_job(api,job,secret):
     p=json.loads(job['payload']); kind=job['kind']
+    if kind in ('social','reaction_edit','reaction_notice'): return features.execute(api,job,secret)
     if kind in ('send','answer'):
         sent=api.call('sendMessage' if kind=='send' else 'answerCallbackQuery',**p)
         if kind=='send' and int(p['chat_id'])>0:
@@ -262,6 +272,8 @@ def execute_job(api,job,secret):
         nick=hmac.new(secret.encode(),f"{p['epoch']}:{p['uid']}".encode(),hashlib.sha256).hexdigest()[:8]
         content=p['content']; label=f"Аноним {nick}"
         payload={'chat_id':p['recipient'],'protect_content':True}
+        with connect() as db: reply_label=features.decorate(db,p,secret,payload)
+        label=reply_label+label
         if content['type']=='text':
             method='sendMessage'; payload.update(text=label+'\n\n'+content['text'],link_preview_options={'is_disabled':True})
         else:
@@ -272,12 +284,14 @@ def execute_job(api,job,secret):
         with connect() as db:
             db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',
                        (p['recipient'],sent['message_id'],time.time()))
+            features.save_copy(db,p,sent['message_id'])
         return 'Доставлено участнику'
     if kind=='rotate': return rotate()
     if kind=='cleanup':
         deleted=failed=0
         cutoff=p.get('cutoff',time.time())
         with connect() as db:
+            features.expire(db,cutoff)
             # Don't deliver stale queued chat content after the cleanup cycle.
             db.execute("UPDATE jobs SET status='cancelled',payload='{}',result='Цикл очистки переписки' WHERE kind='chat_delivery' AND status='queued' AND created<=?",(cutoff,))
             rows=db.execute("SELECT * FROM chat_messages WHERE state='active' AND chat_id>0 AND created<=? ORDER BY created LIMIT 500",(cutoff,)).fetchall()
