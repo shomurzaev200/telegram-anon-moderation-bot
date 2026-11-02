@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Журнал событий</h1>{% for row in rows %}<section class="card"><small>{{ row.created|date }}</small><pre>{{ row.detail }}</pre></section>{% else %}<p>Событий пока нет.</p>{% endfor %}{% if page>1 %}<a href="?page={{ page-1 }}">← Назад</a>{% endif %}{% if more %}<a href="?page={{ page+1 }}">Далее →</a>{% endif %}{% endblock %}
