@@ -12,8 +12,12 @@ from db import DATA, connect, decide, enqueue, event, get, init_db, set_value
 
 log=logging.getLogger('anon')
 STOP=threading.Event()
-MENU={'keyboard':[[{'text':'📝 Отправить пост'},{'text':'💬 Анонимный чат'}],
-                  [{'text':'📜 Правила'},{'text':'🆔 Мой ID'}]],'resize_keyboard':True}
+JOIN='💬 Вступить в анонимный чат'
+LEAVE='🚪 Выйти из анонимного чата'
+POST='📝 Написать пост'
+
+def menu(active=False):
+    return {'keyboard':[[{'text':POST}],[{'text':LEAVE if active else JOIN}]],'resize_keyboard':True}
 
 class APIError(Exception):
     def __init__(self,code,description,retry_after=0):
@@ -41,9 +45,36 @@ class Telegram:
             raise APIError(code,description,data.get('parameters',{}).get('retry_after',0))
         return data['result']
 
+def post_content(message):
+    if 'text' in message:
+        return {'method':'sendMessage','data':{'text':message['text'],'entities':message.get('entities',[])}}
+    methods={'photo':'sendPhoto','video':'sendVideo','animation':'sendAnimation','document':'sendDocument',
+             'voice':'sendVoice','audio':'sendAudio','sticker':'sendSticker','video_note':'sendVideoNote'}
+    for kind,method in methods.items():
+        if kind in message:
+            file=message[kind][-1] if kind=='photo' else message[kind]
+            data={kind:file['file_id']}
+            if kind not in ('sticker','video_note'):
+                data.update(caption=message.get('caption',''),caption_entities=message.get('caption_entities',[]))
+            return {'method':method,'data':data}
+    raise ValueError('Unsupported post content')
+
+def send_post(api,post,destination,buttons=None):
+    if post['content']:
+        content=json.loads(post['content'])
+        payload=dict(content['data'],chat_id=destination)
+        if buttons: payload['reply_markup']=buttons
+        return api.call(content['method'],**payload)
+    # Compatibility for existing v2 submissions, whose original message still exists.
+    payload={'chat_id':destination,'from_chat_id':post['source_chat'],'message_id':post['source_message']}
+    if buttons: payload['reply_markup']=buttons
+    return api.call('copyMessage',**payload)
+
 def reply(db,uid,text,menu=False):
     payload={'chat_id':uid,'text':text}
-    if menu: payload['reply_markup']=MENU
+    if menu:
+        member=db.execute('SELECT chat_active FROM users WHERE id=?',(uid,)).fetchone()
+        payload['reply_markup']=globals()['menu'](bool(member and member[0]))
     enqueue(db,'send',payload)
 
 def process_update(update):
@@ -69,7 +100,8 @@ def process_update(update):
         if not db.execute('INSERT OR IGNORE INTO processed VALUES(?)',(update_id,)).rowcount: return
         if not m or m['chat']['type']!='private' or m.get('from',{}).get('is_bot'): return
         uid=m['from']['id']
-        db.execute('INSERT OR IGNORE INTO users(id,created) VALUES(?,?)',(uid,time.time()))
+        db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',(uid,m['message_id'],time.time()))
+        db.execute("INSERT OR IGNORE INTO users(id,created,mode) VALUES(?,?,'idle')",(uid,time.time()))
         u=db.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
         if u['blocked']:
             # Silent block avoids creating spam reply jobs.
@@ -78,32 +110,69 @@ def process_update(update):
         text=m.get('text','')
         command=text.split()[0].split('@')[0] if text.startswith('/') else text
         if command in ('/start','/help'):
-            reply(db,uid,'Выберите режим. /post — отправить пост на модерацию; /chat — текстовый анонимный чат. '
-                  'Публика видит бота, но администрация хранит ваш Telegram ID. Не отправляйте личные данные. '
-                  'Фото и видео могут сами раскрывать личность.',True)
+            db.execute("UPDATE users SET mode='idle' WHERE id=?",(uid,))
+            reply(db,uid,'Добро пожаловать! Здесь можно общаться анонимно или предложить пост в канал. '
+                  'Только посты проходят модерацию. В чате участники видят псевдонимы; '
+                  'администрация сервера имеет доступ к Telegram ID. '
+                  f"⚠️ Каждые {settings['CLEANUP_HOURS']} ч запускается очистка всей переписки с ботом: ваших сообщений, постов и ответов бота. "
+                  'Заявки на модерации и опубликованные посты в канале сохраняются. '
+                  'Удаление зависит от ограничений Telegram; скриншоты и сохранённые копии удалить невозможно.',True)
             return
         if command in ('/id','🆔 Мой ID'):
             reply(db,uid,f'Ваш Telegram ID: {uid}'); return
         if command in ('/rules','📜 Правила'):
             reply(db,uid,settings['RULES']); return
-        if command in ('/post','📝 Отправить пост','/chat','💬 Анонимный чат'):
-            mode='chat' if command in ('/chat','💬 Анонимный чат') else 'post'
-            db.execute('UPDATE users SET mode=? WHERE id=?',(mode,uid))
-            reply(db,uid,'Отправьте текст для анонимного чата.' if mode=='chat' else
-                  'Отправьте один текст, фото, видео, документ, голосовое или стикер. Альбомы не поддерживаются; отправляйте по одному.')
+        if command in ('/chat',JOIN,'💬 Анонимный чат'):
+            if settings['CHAT_ENABLED']!='1':
+                reply(db,uid,'Анонимный чат сейчас выключен.',True); return
+            db.execute("UPDATE users SET chat_session=chat_session+CASE WHEN chat_active=0 THEN 1 ELSE 0 END,chat_active=1,mode='idle' WHERE id=?",(uid,))
+            reply(db,uid,'Вы в анонимном чате. Ваши сообщения увидят участники, которые вступили в чат. '
+                  'Новая переписка приходит сюда, без модерации. Старая история не загружается. '
+                  f"⚠️ Каждые {settings['CLEANUP_HOURS']} ч запускается очистка всей переписки с ботом, включая ваши сообщения и посты. "
+                  'Telegram может не разрешить удалить отдельные сообщения; сохранённые копии и скриншоты удалить невозможно. '
+                  'Чтобы прекратить общение, нажмите «Выйти из анонимного чата».',True)
+            return
+        if command in ('/leave',LEAVE):
+            db.execute("UPDATE users SET chat_active=0,chat_session=chat_session+1,mode='idle' WHERE id=?",(uid,))
+            reply(db,uid,'Вы вышли из анонимного чата. Новые сообщения больше не доставляются.',True)
+            return
+        if command in ('/post',POST,'📝 Отправить пост'):
+            db.execute("UPDATE users SET mode='post' WHERE id=?",(uid,))
+            reply(db,uid,'Следующее сообщение будет ПОСТОМ: оно попадёт на модерацию, затем — в канал после одобрения. '
+                  'Отправьте один текст или медиа. /cancel — отменить.',True)
+            return
+        if command=='/cancel':
+            db.execute("UPDATE users SET mode='idle' WHERE id=?",(uid,))
+            reply(db,uid,'Написание поста отменено.' + (' Вы снова пишете в чат.' if u['chat_active'] else ''),True)
             return
         if text.startswith('/'):
-            reply(db,uid,'Неизвестная команда. Используйте /post, /chat, /rules, /id.'); return
+            reply(db,uid,'Используйте кнопки меню или /chat, /leave, /post, /cancel.',True); return
+        if u['mode']!='post' and not u['chat_active']:
+            reply(db,uid,'Сначала нажмите «Вступить в анонимный чат» или «Написать пост».',True); return
         now=time.time()
-        if now-u['last_sent']<int(settings['COOLDOWN_SECONDS']): return
-        db.execute('UPDATE users SET last_sent=? WHERE id=?',(now,uid))
-        if u['mode']=='chat':
-            if settings['CHAT_ENABLED']!='1' or not settings['ANON_GROUP_ID']:
-                reply(db,uid,'Анонимный чат сейчас выключен.'); return
-            if not text or len(text)>3500:
-                reply(db,uid,'Чат принимает только текст до 3500 символов.'); return
-            enqueue(db,'chat',{'uid':uid,'chat_id':int(settings['ANON_GROUP_ID']),'text':text})
-            reply(db,uid,'Сообщение принято в очередь чата.'); return
+        if now-u['last_sent']<int(settings['COOLDOWN_SECONDS']):
+            reply(db,uid,'Слишком быстро. Подождите несколько секунд и отправьте сообщение снова.'); return
+        if u['mode']!='post':
+            if settings['CHAT_ENABLED']!='1':
+                reply(db,uid,'Анонимный чат временно выключен.',True); return
+            media=next((k for k in ('photo','video','animation','document','voice','audio') if k in m),None)
+            if m.get('media_group_id') or (not text and not media):
+                reply(db,uid,'Отправьте текст, отдельное фото, видео, анимацию, документ, аудио или голосовое. Альбомы, контакты и локации не поддерживаются.'); return
+            if len(text)>3500 or len(m.get('caption',''))>900:
+                reply(db,uid,'Максимум 3500 символов текста или 900 символов подписи.'); return
+            content={'type':'text','text':text}
+            if media:
+                file=m[media][-1] if media=='photo' else m[media]
+                content={'type':media,'file_id':file['file_id'],'text':m.get('caption','')}
+            # Snapshot recipients and their membership generation at submission, not dispatch.
+            members=db.execute('SELECT id,chat_session FROM users WHERE chat_active=1 AND blocked=0 AND id!=?',(uid,)).fetchall()
+            db.execute('UPDATE users SET last_sent=? WHERE id=?',(now,uid))
+            db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',(uid,m['message_id'],now))
+            for member in members:
+                enqueue(db,'chat_delivery',{'uid':uid,'recipient':member['id'],'session':member['chat_session'],
+                    'epoch':settings['NICK_EPOCH'],'content':content})
+            if not members: reply(db,uid,'Сейчас других участников нет. Новые участники это сообщение не получат.')
+            return
         if not settings['MODERATION_CHANNEL_ID'] or not settings['PUBLIC_CHANNEL_ID']:
             reply(db,uid,'Публикации ещё не настроены администратором.'); return
         if m.get('media_group_id'):
@@ -112,12 +181,13 @@ def process_update(update):
         if not kind:
             reply(db,uid,'Этот тип сообщения не поддерживается. Отправьте текст или медиа.'); return
         preview=(m.get('text') or m.get('caption') or f'[{kind}]')[:4096]
-        cursor=db.execute('INSERT OR IGNORE INTO posts(uid,source_chat,source_message,preview,kind,created) VALUES(?,?,?,?,?,?)',
-                          (uid,m['chat']['id'],m['message_id'],preview,kind,now))
+        cursor=db.execute('INSERT OR IGNORE INTO posts(uid,source_chat,source_message,preview,kind,created,content) VALUES(?,?,?,?,?,?,?)',
+                          (uid,m['chat']['id'],m['message_id'],preview,kind,now,json.dumps(post_content(m),ensure_ascii=False)))
         if not cursor.rowcount: return
+        db.execute("UPDATE users SET mode='idle',last_sent=? WHERE id=?",(now,uid))
         pid=cursor.lastrowid
         enqueue(db,'moderate',{'post_id':pid,'chat_id':int(settings['MODERATION_CHANNEL_ID'])})
-        reply(db,uid,f'Заявка #{pid} принята на модерацию.')
+        reply(db,uid,f'Заявка #{pid} принята на модерацию.' + (' Теперь вы снова пишете в анонимный чат.' if u['chat_active'] else ' Для нового поста снова нажмите «Написать пост».'),True)
 
 def poll(token):
     api=Telegram(token)
@@ -153,15 +223,20 @@ def rotate():
 def execute_job(api,job,secret):
     p=json.loads(job['payload']); kind=job['kind']
     if kind in ('send','answer'):
-        api.call('sendMessage' if kind=='send' else 'answerCallbackQuery',**p)
+        sent=api.call('sendMessage' if kind=='send' else 'answerCallbackQuery',**p)
+        if kind=='send' and int(p['chat_id'])>0:
+            with connect() as db:
+                db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',(p['chat_id'],sent['message_id'],time.time()))
         return 'Доставлено'
     if kind=='moderate':
         with connect() as db: post=db.execute('SELECT * FROM posts WHERE id=?',(p['post_id'],)).fetchone()
         if post['status']!='pending': return 'Заявка уже обработана'
         buttons={'inline_keyboard':[[{'text':f"✅ Опубликовать #{post['id']}",'callback_data':f"publish:{post['id']}"},
                                     {'text':'❌ Отклонить','callback_data':f"reject:{post['id']}"}]]}
-        api.call('copyMessage',chat_id=p['chat_id'],from_chat_id=post['source_chat'],
-                 message_id=post['source_message'],reply_markup=buttons)
+        sent=send_post(api,post,p['chat_id'],buttons)
+        if not post['content']:
+            with connect() as db:
+                db.execute('UPDATE posts SET source_chat=?,source_message=? WHERE id=?',(p['chat_id'],sent['message_id'],post['id']))
         return 'Отправлено модераторам'
     if kind=='publish':
         with connect() as db:
@@ -169,27 +244,52 @@ def execute_job(api,job,secret):
             post=db.execute('SELECT * FROM posts WHERE id=?',(p['post_id'],)).fetchone()
             if post['status']!='queued': return 'Заявка уже обработана'
             db.execute("UPDATE posts SET status='publishing' WHERE id=?",(post['id'],))
-        sent=api.call('copyMessage',chat_id=post['destination'],from_chat_id=post['source_chat'],message_id=post['source_message'])
+        sent=send_post(api,post,post['destination'])
         with connect() as db:
             db.execute("UPDATE posts SET status='published',published_message=? WHERE id=?",(sent['message_id'],post['id']))
             reply(db,post['uid'],f"Заявка #{post['id']} опубликована.")
             event(db,f"Опубликована заявка #{post['id']}")
         return f"Опубликовано: сообщение {sent['message_id']}"
     if kind=='chat':
-        with connect() as db: u=db.execute('SELECT blocked FROM users WHERE id=?',(p['uid'],)).fetchone()
-        if not u or u['blocked'] or get('CHAT_ENABLED')!='1': return 'Отменено: чат выключен или пользователь заблокирован'
-        nick=hmac.new(secret.encode(),f"{get('NICK_EPOCH')}:{p['uid']}".encode(),hashlib.sha256).hexdigest()[:8]
-        sent=api.call('sendMessage',chat_id=p['chat_id'],text=f"Аноним {nick}\n\n{p['text']}",link_preview_options={'is_disabled':True})
+        return 'Старая доставка в группу отменена'
+    if kind=='chat_delivery':
         with connect() as db:
-            db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',(p['chat_id'],sent['message_id'],time.time()))
-        return 'Отправлено в анонимный чат'
+            recipient=db.execute('SELECT * FROM users WHERE id=?',(p['recipient'],)).fetchone()
+            author=db.execute('SELECT blocked FROM users WHERE id=?',(p['uid'],)).fetchone()
+        if (not recipient or not recipient['chat_active'] or recipient['blocked'] or
+            recipient['chat_session']!=p['session'] or not author or author['blocked'] or get('CHAT_ENABLED')!='1'):
+            return 'Отменено: участник вышел, заблокирован или чат выключен'
+        nick=hmac.new(secret.encode(),f"{p['epoch']}:{p['uid']}".encode(),hashlib.sha256).hexdigest()[:8]
+        content=p['content']; label=f"Аноним {nick}"
+        payload={'chat_id':p['recipient'],'protect_content':True}
+        if content['type']=='text':
+            method='sendMessage'; payload.update(text=label+'\n\n'+content['text'],link_preview_options={'is_disabled':True})
+        else:
+            kind_name=content['type']
+            method='send'+kind_name.capitalize()
+            payload.update({kind_name:content['file_id'],'caption':label+'\n\n'+content['text']})
+        sent=api.call(method,**payload)
+        with connect() as db:
+            db.execute('INSERT OR IGNORE INTO chat_messages(chat_id,message_id,created) VALUES(?,?,?)',
+                       (p['recipient'],sent['message_id'],time.time()))
+        return 'Доставлено участнику'
     if kind=='rotate': return rotate()
     if kind=='cleanup':
         deleted=failed=0
-        # Only our tracked messages, including older configured groups. Idempotent deletes.
-        with connect() as db: rows=db.execute("SELECT * FROM chat_messages WHERE state='active' ORDER BY created LIMIT 500").fetchall()
+        cutoff=p.get('cutoff',time.time())
+        with connect() as db:
+            # Don't deliver stale queued chat content after the cleanup cycle.
+            db.execute("UPDATE jobs SET status='cancelled',payload='{}',result='Цикл очистки переписки' WHERE kind='chat_delivery' AND status='queued' AND created<=?",(cutoff,))
+            rows=db.execute("SELECT * FROM chat_messages WHERE state='active' AND chat_id>0 AND created<=? ORDER BY created LIMIT 500",(cutoff,)).fetchall()
         for row in rows:
             if STOP.is_set(): break
+            # Preserve an old-format pending post if its private source has not been archived.
+            with connect() as db:
+                legacy=db.execute("SELECT 1 FROM posts WHERE source_chat=? AND source_message=? AND content='' AND status IN ('pending','queued','publishing')",(row['chat_id'],row['message_id'])).fetchone()
+            if legacy:
+                with connect() as db: db.execute("UPDATE chat_messages SET state='protected' WHERE chat_id=? AND message_id=?",(row['chat_id'],row['message_id']))
+                failed+=1
+                continue
             try:
                 api.call('deleteMessage',chat_id=row['chat_id'],message_id=row['message_id'])
                 state='deleted'; deleted+=1
@@ -201,13 +301,13 @@ def execute_job(api,job,secret):
                 db.execute('UPDATE chat_messages SET state=? WHERE chat_id=? AND message_id=?',(state,row['chat_id'],row['message_id']))
                 set_value(db,'HEARTBEAT',time.time())
         with connect() as db:
-            remaining=db.execute("SELECT count(*) FROM chat_messages WHERE state='active'").fetchone()[0]
-            if remaining and not STOP.is_set(): enqueue(db,'cleanup',{})
+            remaining=db.execute("SELECT count(*) FROM chat_messages WHERE state='active' AND chat_id>0 AND created<=?",(cutoff,)).fetchone()[0]
+            if remaining and not STOP.is_set(): enqueue(db,'cleanup',{'cutoff':cutoff})
         if not remaining: rotate()
         return f'Удалено: {deleted}; не удалось: {failed}; осталось: {remaining}. Неудачные удаления автоматически не повторяются.'
     if kind=='check':
         me=api.call('getMe'); results=[f"Бот: @{me.get('username','')} ({me['id']})"]
-        for key in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID','ANON_GROUP_ID'):
+        for key in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID'):
             cid=get(key)
             if not cid: results.append(f'{key}: не настроено'); continue
             try:
@@ -239,6 +339,14 @@ def run_job(api,job,secret):
             pid=json.loads(job['payload'])['post_id']
             db.execute('UPDATE posts SET status=? WHERE id=? AND status IN (?,?)',(status,pid,'publishing','queued'))
         if status in ('failed','uncertain'): event(db,f"Задача #{job['id']} ({job['kind']}): {result}")
+        if job['kind']=='chat_delivery':
+            if status=='failed' and result.startswith('Telegram 403:'):
+                p=json.loads(job['payload'])
+                db.execute('UPDATE users SET chat_active=0,chat_session=chat_session+1 WHERE id=? AND chat_session=?',
+                           (p['recipient'],p['session']))
+            if status in ('done','failed','uncertain'):
+                db.execute("UPDATE jobs SET payload='{}' WHERE id=?",(job['id'],))
+
 
 def recover():
     with connect() as db:

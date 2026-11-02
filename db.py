@@ -30,6 +30,14 @@ def connect():
         db.close()
 
 def init_db():
+    # Serialize schema setup across Gunicorn workers and the bot, including WAL activation.
+    import fcntl
+    with open(str(DB_PATH)+'.schema.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        _init_db()
+
+
+def _init_db():
     with connect() as db:
         db.execute('PRAGMA journal_mode=WAL')
         db.executescript('''
@@ -51,6 +59,22 @@ def init_db():
         CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT PRIMARY KEY,n INTEGER NOT NULL,until REAL NOT NULL);
         ''')
         db.executemany('INSERT OR IGNORE INTO settings VALUES(?,?)', DEFAULTS.items())
+        # Serialized, additive migration: both web workers and bot may start together.
+        db.execute('BEGIN IMMEDIATE') if not db.in_transaction else None
+        columns={r[1] for r in db.execute('PRAGMA table_info(users)')}
+        if 'chat_active' not in columns:
+            db.execute('ALTER TABLE users ADD COLUMN chat_active INTEGER NOT NULL DEFAULT 0')
+        if 'chat_session' not in columns:
+            db.execute('ALTER TABLE users ADD COLUMN chat_session INTEGER NOT NULL DEFAULT 0')
+        if not db.execute("SELECT 1 FROM settings WHERE key='RELAY_VERSION'").fetchone():
+            db.execute("UPDATE users SET mode='idle'")
+            db.execute("UPDATE jobs SET status='cancelled',payload='{}',result='Старый групповой чат отключён' WHERE kind='chat' AND status='queued'")
+            db.execute("INSERT INTO settings VALUES('RELAY_VERSION','1')")
+        db.execute('CREATE INDEX IF NOT EXISTS users_chat_active ON users(chat_active,blocked)')
+        if 'content' not in {r[1] for r in db.execute('PRAGMA table_info(posts)')}:
+            db.execute("ALTER TABLE posts ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+
+
     os.chmod(DB_PATH, 0o600)
 
 def get(key, default=''):

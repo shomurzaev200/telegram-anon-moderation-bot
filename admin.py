@@ -7,7 +7,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, sessi
 from werkzeug.security import check_password_hash, generate_password_hash
 from db import DATA, DEFAULTS, connect, decide, enqueue, event, get, init_db, set_value
 
-EDITABLE = tuple(k for k in DEFAULTS if k not in ('AUTH_VERSION','NICK_EPOCH'))
+EDITABLE = tuple(k for k in DEFAULTS if k not in ('AUTH_VERSION','NICK_EPOCH','ANON_GROUP_ID'))
 
 def create_app(test_config=None):
     init_db()
@@ -121,11 +121,11 @@ def create_app(test_config=None):
                 if not any(ids) or any(not v.isdigit() or int(v)<=0 for v in ids if v):
                     raise ValueError('Укажите положительные Telegram ID администраторов через запятую.')
                 values['ADMIN_IDS']=','.join(str(int(v)) for v in ids if v)
-                for key in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID','ANON_GROUP_ID'):
+                for key in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID'):
                     if not values[key] or not values[key].lstrip('-').isdigit() or int(values[key])>=0:
                         raise ValueError(f'{key}: нужен отрицательный числовой ID, обычно -100…')
-                if len({values[k] for k in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID','ANON_GROUP_ID')})!=3:
-                    raise ValueError('Модерация, публикации и чат должны иметь разные ID.')
+                if len({values[k] for k in ('MODERATION_CHANNEL_ID','PUBLIC_CHANNEL_ID')})!=2:
+                    raise ValueError('Каналы модерации и публикации должны иметь разные ID.')
                 if values['CHAT_ENABLED'] not in ('0','1'): raise ValueError('CHAT_ENABLED: только 0 или 1')
                 for key,low,high in [('CLEANUP_HOURS',1,24),('COOLDOWN_SECONDS',1,3600)]:
                     if not values[key].isdigit() or not low<=int(values[key])<=high: raise ValueError(f'{key}: от {low} до {high}')
@@ -153,7 +153,7 @@ def create_app(test_config=None):
     @app.post('/users/<int:uid>/toggle')
     def block(uid):
         with connect() as db:
-            db.execute('UPDATE users SET blocked=1-blocked WHERE id=?',(uid,))
+            db.execute('UPDATE users SET blocked=1-blocked,chat_active=0,chat_session=chat_session+1 WHERE id=?',(uid,))
             event(db,f'web-admin: изменение блокировки {uid}')
         return redirect(url_for('users'))
 
