@@ -10,6 +10,7 @@ import time
 import requests
 import chat_features as features
 import discussions
+import post_votes
 from delivery_queue import RateLimiter, Deferred, claim
 from db import DATA, connect, decide, enqueue, event, get, init_db, set_value
 
@@ -99,6 +100,7 @@ def reply(db,uid,text,menu=False):
 def process_update(update):
     update_id=update['update_id']
     callback=update.get('callback_query')
+    if callback and post_votes.callback(update): return
     if callback and discussions.callback(update): return
     if callback and features.callback(update): return
     if callback:
@@ -251,6 +253,7 @@ def rotate():
 
 def execute_job(api,job,secret):
     p=json.loads(job['payload']); kind=job['kind']
+    if kind=='post_vote_refresh': return post_votes.execute(api,job)
     if kind in ('post_notice','discussion_view'): return discussions.execute(api,job,secret)
     if kind in ('social','reaction_edit','reaction_notice'): return features.execute(api,job,secret)
     if kind in ('send','answer'):
@@ -276,7 +279,7 @@ def execute_job(api,job,secret):
             if post['status']!='queued': return 'Заявка уже обработана'
             db.execute("UPDATE posts SET status='publishing' WHERE id=?",(post['id'],))
         username=get('BOT_USERNAME')
-        buttons={'inline_keyboard':[[{'text':'💬 Анонимные комментарии','url':f"https://t.me/{username}?start=post_{post['id']}"}]]} if username else None
+        with connect() as db: buttons=post_votes.markup(db,post['id'],username)
         sent=send_post(api,post,post['destination'],buttons,anonymous=True)
         with connect() as db:
             db.execute("UPDATE posts SET status='published',published_message=? WHERE id=?",(sent['message_id'],post['id']))

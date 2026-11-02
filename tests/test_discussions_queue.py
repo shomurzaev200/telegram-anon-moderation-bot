@@ -23,7 +23,7 @@ def test_publication_signature_button_and_notifications(setup):
     api,job=publish()
     payload=api.calls[0][1]
     assert payload['text'].endswith('\n\nАнон.')
-    assert payload['reply_markup']['inline_keyboard'][0][0]['url']=='https://t.me/example_bot?start=post_1'
+    assert payload['reply_markup']['inline_keyboard'][1][0]['url']=='https://t.me/example_bot?start=post_1'
     bot.run_job(api,job,'secret')
     with db.connect() as c:
         notices=[json.loads(r[0])['uid'] for r in c.execute("SELECT payload FROM jobs WHERE kind='post_notice'")]

@@ -62,6 +62,8 @@ def _init_db():
           session INTEGER NOT NULL,is_bot INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id));
         CREATE INDEX IF NOT EXISTS relay_copies_message ON relay_copies(relay_id,chat_id,session);
         CREATE TABLE IF NOT EXISTS chat_reactions(relay_id INTEGER,uid INTEGER,emoji TEXT NOT NULL,PRIMARY KEY(relay_id,uid));
+        CREATE TABLE IF NOT EXISTS post_votes(post_id INTEGER NOT NULL,uid INTEGER NOT NULL,
+          vote INTEGER NOT NULL CHECK(vote IN (-1,1)),PRIMARY KEY(post_id,uid));
         CREATE TABLE IF NOT EXISTS post_comments(id INTEGER PRIMARY KEY,post_id INTEGER NOT NULL,uid INTEGER NOT NULL,
           body TEXT NOT NULL,created REAL NOT NULL,hidden INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS comments_post ON post_comments(post_id,hidden,id);
